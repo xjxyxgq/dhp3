@@ -28,6 +28,9 @@ set -uo pipefail
 
 # ─── 输出函数 ─────────────────────────────────────────────────────────────────
 
+# 结果缓存
+RESULTS=()
+
 # 转义 JSON 字符串中的特殊字符
 _json_esc() {
     local s="$1"
@@ -41,12 +44,24 @@ _json_esc() {
 
 emit() {
     local status="$1" key="$2" info="$3"
-    printf '{"status":"%s","key":"%s","info":"%s"}\n' \
-        "$status" "$(_json_esc "$key")" "$(_json_esc "$info")"
+    RESULTS+=("$(printf '{"status":"%s","key":"%s","info":"%s"}' \
+        "$status" "$(_json_esc "$key")" "$(_json_esc "$info")")")
 }
 
 emit_ok()  { emit "ok"    "$1" "$2"; }
-emit_err() { emit "error" "$1" "$2"; exit 1; }
+emit_err() {
+    emit "error" "$1" "$2"
+    # 在输出错误时立即打印结果
+    printf '%s\n' "${RESULTS[@]}"
+    exit 1
+}
+
+# 输出所有结果
+output_results() {
+    if [[ ${#RESULTS[@]} -gt 0 ]]; then
+        printf '%s\n' "${RESULTS[@]}"
+    fi
+}
 
 # ─── 参数解析 ─────────────────────────────────────────────────────────────────
 
@@ -123,21 +138,11 @@ if _cpus_overlap "$NODE0_CPUS" "$NODE1_CPUS"; then
 fi
 emit_ok "lscpu.numa_cpu_overlap" "node0 与 node1 CPU 核心无重叠"
 
-# ─── 确定 NUMA 分配期望值 ─────────────────────────────────────────────────────
-
-if [[ $SWAP -eq 0 ]]; then
-    EXPECTED_NUDB_NODE=0
-    EXPECTED_PROXY_NODE=1
-else
-    EXPECTED_NUDB_NODE=1
-    EXPECTED_PROXY_NODE=0
-fi
-
 # ─── 检查 .numanode 文件 ──────────────────────────────────────────────────────
 
 # 检查单个 .numanode 文件
 _check_numanode_file() {
-    local file="$1" expected_node="$2" key="$3"
+    local file="$1" expected_node="$2" node_cpus="$3" key="$4"
 
     if [[ ! -f "$file" ]]; then
         emit_err "$key" "文件不存在: $file"
@@ -146,49 +151,75 @@ _check_numanode_file() {
     local current
     current=$(tr -d '[:space:]' < "$file" 2>/dev/null || echo "无法读取文件")
 
-    # 验证文件内容是否为有效的数字
-    if ! [[ "$current" =~ ^[0-9]+$ ]]; then
-        emit_err "$key" "文件内容无效，应为数字（0 或 1），实际为: $current"
+    # 验证文件内容是否为有效的 CPU 列表（如 "0-23" 或 "0-23,48-71"）
+    if ! [[ "$current" =~ ^[0-9,-]+$ ]] || ! echo "$current" | grep -qE '^(-?[0-9]+(-[0-9]+)?,)*-?[0-9]+(-[0-9]+)?$'; then
+        emit_err "$key" "文件内容无效，应为 CPU 列表格式（如 0-23 或 0-23,48-71），实际为: $current"
     fi
 
-    if [[ "$current" == "$expected_node" ]]; then
-        emit_ok "$key" "node${current}"
+    # 检查 CPU 列表是否在正确的 NUMA 节点上
+    if [[ $expected_node -eq 0 ]]; then
+        # 检查是否与 node0 的 CPU 列表匹配
+        if ! _cpu_sets_equal "$current" "$node_cpus"; then
+            emit_err "$key" "CPU 列表不属于 node0 期望的 CPU 范围，实际: $current，期望: $node_cpus"
+        fi
     else
-        emit_err "$key" "期望 node${expected_node}，实际为 ${current}"
+        # 检查是否与 node1 的 CPU 列表匹配
+        if ! _cpu_sets_equal "$current" "$node_cpus"; then
+            emit_err "$key" "CPU 列表不属于 node1 期望的 CPU 范围，实际: $current，期望: $node_cpus"
+        fi
     fi
+
+    emit_ok "$key" "node${expected_node}，CPU: $current"
 }
 
+# 检查两个 CPU 列表是否相同（展开后）
+_cpu_sets_equal() {
+    local set1="$1" set2="$2"
+    local expanded1 expanded2
+
+    expanded1=$(_expand_cpus "$set1" | sort -n)
+    expanded2=$(_expand_cpus "$set2" | sort -n)
+
+    # 使用 diff 比较两个有序列表
+    diff -q <(echo "$expanded1") <(echo "$expanded2") >/dev/null 2>&1
+}
+
+# 默认分配：nudb1 使用 node0，nudbproxy1 使用 node1
+if [[ $SWAP -eq 0 ]]; then
+    CHECK_NUDB_NODE=0
+    CHECK_PROXY_NODE=1
+    NUDB_CPUS="$NODE0_CPUS"
+    PROXY_CPUS="$NODE1_CPUS"
+else
+    # 交换分配：nudb1 使用 node1，nudbproxy1 使用 node0
+    CHECK_NUDB_NODE=1
+    CHECK_PROXY_NODE=0
+    NUDB_CPUS="$NODE1_CPUS"
+    PROXY_CPUS="$NODE0_CPUS"
+fi
+
 # 检查 nudb1 的 .numanode 配置
-_check_numanode_file "$NUDB1_FILE" "$EXPECTED_NUDB_NODE" "nudb1.numanode"
+_check_numanode_file "$NUDB1_FILE" "$CHECK_NUDB_NODE" "$NUDB_CPUS" "nudb1.numanode"
 
 # 检查 nudbproxy1 的 .numanode 配置
-_check_numanode_file "$PROXY_FILE" "$EXPECTED_PROXY_NODE" "nudbproxy1.numanode"
+_check_numanode_file "$PROXY_FILE" "$CHECK_PROXY_NODE" "$PROXY_CPUS" "nudbproxy1.numanode"
 
-# ─── 检查 CPU 核心是否实际匹配 NUMA 节点 ───────────────────────────────────
+# ─── 检查两个服务的 CPU 列表是否互不重叠 ───────────────────────────────────
 
-# 获取实际的 .numanode 配置
-NUDB_NODE=$(tr -d '[:space:]' < "$NUDB1_FILE" 2>/dev/null || echo "invalid")
-PROXY_NODE=$(tr -d '[:space:]' < "$PROXY_FILE" 2>/dev/null || echo "invalid")
+# 获取实际的 CPU 配置
+NUDB_CPUS=$(tr -d '[:space:]' < "$NUDB1_FILE" 2>/dev/null || echo "")
+PROXY_CPUS=$(tr -d '[:space:]' < "$PROXY_FILE" 2>/dev/null || echo "")
 
-# 验证 nudb1 是否真的绑定了 node0/node1 的 CPU
-if [[ "$NUDB_NODE" == "0" ]]; then
-    if _cpus_overlap "$NODE0_CPUS" "$NODE1_CPUS"; then
-        emit_err "nudb1.cpu_correct" "CPU 拓扑异常，无法验证绑定关系"
+# 检查两个 CPU 列表是否重叠
+if [[ -n "$NUDB_CPUS" && -n "$PROXY_CPUS" ]]; then
+    if _cpus_overlap "$NUDB_CPUS" "$PROXY_CPUS"; then
+        emit_err "service_cpu_overlap" "nudb1 和 nudbproxy1 的 CPU 列表存在重叠，nudb1: $NUDB_CPUS, nudbproxy1: $PROXY_CPUS"
+    else
+        emit_ok "service_cpu_overlap" "nudb1 和 nudbproxy1 CPU 核心互不重叠，nudb1: $NUDB_CPUS, nudbproxy1: $PROXY_CPUS"
     fi
-    # nudb1 应该绑定 node0，检查其 CPU 是否真的属于 node0
-    # 由于 CPU 列表可能很长，这里只验证配置一致性
-    emit_ok "nudb1.cpu_correct" "配置正确，绑定 node0，CPU: $NODE0_CPUS"
-elif [[ "$NUDB_NODE" == "1" ]]; then
-    emit_ok "nudb1.cpu_correct" "配置正确，绑定 node1，CPU: $NODE1_CPUS"
 else
-    emit_err "nudb1.cpu_correct" "无效的 NUMA 节点值: $NUDB_NODE"
+    emit_err "service_cpu_overlap" "无法读取 CPU 配置：nudb1: ${NUDB_CPUS:-空}, nudbproxy1: ${PROXY_CPUS:-空}"
 fi
 
-# 验证 nudbproxy1 是否真的绑定了 node0/node1 的 CPU
-if [[ "$PROXY_NODE" == "0" ]]; then
-    emit_ok "nudbproxy1.cpu_correct" "配置正确，绑定 node0，CPU: $NODE0_CPUS"
-elif [[ "$PROXY_NODE" == "1" ]]; then
-    emit_ok "nudbproxy1.cpu_correct" "配置正确，绑定 node1，CPU: $NODE1_CPUS"
-else
-    emit_err "nudbproxy1.cpu_correct" "无效的 NUMA 节点值: $PROXY_NODE"
-fi
+# 输出所有结果
+output_results
