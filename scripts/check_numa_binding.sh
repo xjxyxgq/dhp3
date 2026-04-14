@@ -49,18 +49,49 @@ emit() {
 }
 
 emit_ok()  { emit "ok"    "$1" "$2"; }
-emit_err() {
-    emit "error" "$1" "$2"
-    # 在输出错误时立即打印结果
-    printf '%s\n' "${RESULTS[@]}"
-    exit 1
+emit_err() { emit "error" "$1" "$2"; }
+
+# 输出所有结果（符合要求的格式）
+output_results() {
+    # 检查是否有错误
+    local has_error=false
+    for result in "${RESULTS[@]}"; do
+        if [[ "$result" == *"\"status\":\"error\""* ]]; then
+            has_error=true
+            break
+        fi
+    done
+
+    # 确定最终状态
+    local final_status
+    if [[ "$has_error" == "true" ]]; then
+        final_status="error"
+    else
+        final_status="ok"
+    fi
+
+    # 转义所有结果
+    local escaped_results="["
+
+    for ((i=0; i<${#RESULTS[@]}; i++)); do
+        if [[ $i -gt 0 ]]; then
+            escaped_results+=", "
+        fi
+        # 使用 JSON 转义函数转义每个结果
+        escaped_results+=$(_json_esc "${RESULTS[$i]}")
+    done
+
+    escaped_results+="]"
+
+    # 输出最终结果
+    printf '{"status":"%s","infos":%s}\n' "$final_status" "$escaped_results"
 }
 
-# 输出所有结果
-output_results() {
-    if [[ ${#RESULTS[@]} -gt 0 ]]; then
-        printf '%s\n' "${RESULTS[@]}"
-    fi
+# 覆盖 emit_err，使其在错误时也输出最终结果
+emit_err() {
+    emit "error" "$1" "$2"
+    output_results
+    exit 1
 }
 
 # ─── 参数解析 ─────────────────────────────────────────────────────────────────
