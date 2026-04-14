@@ -109,10 +109,13 @@ _expand_cpus() {
 }
 
 _cpus_overlap() {
-    local set_a overlap
+    local set_a set_b
     set_a=$(_expand_cpus "$1" | sort -n)
-    overlap=$(_expand_cpus "$2" | sort -n | comm -12 <(echo "$set_a") -)
-    [[ -n "$overlap" ]]
+    set_b=$(_expand_cpus "$2" | sort -n)
+    # 使用 grep 查找交集，替代 comm 命令
+    local overlap
+    overlap=$(grep -xFf <(echo "$set_a") <(echo "$set_b") | grep -c .)
+    [[ $overlap -gt 0 ]]
 }
 
 if _cpus_overlap "$NODE0_CPUS" "$NODE1_CPUS"; then
