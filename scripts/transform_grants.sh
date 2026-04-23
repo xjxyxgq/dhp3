@@ -5,7 +5,7 @@
 # 将 pt-show-grants (MySQL 5.7) 的输出转换为 MySQL 8.x 兼容的授权语句
 #
 #   1. 合并 CREATE USER + ALTER USER IDENTIFIED 为单条语句
-#   2. 过滤指定用户 (-e 参数)
+#   2. 过滤指定用户（支持 -i/-I 包含 与 -e/-E 排除）
 #   3. 将所有 user@'IP' 替换为 user@'%'，同用户名只保留第一个 IP 的授权
 #   4. 支持数据库名称映射 (-d 参数)
 #   5. 支持用户名映射 (-u 参数)
@@ -18,6 +18,9 @@
 set -euo pipefail
 
 EXCLUDE_USERS=""
+EXCLUDE_USER_REGEX=""
+INCLUDE_USERS=""
+INCLUDE_USER_REGEX=""
 DB_MAP=""
 USER_MAP=""
 REPLACE_HOST_WITH_WILDCARD="1"
@@ -25,11 +28,18 @@ VERBOSE_LEVEL=0
 
 usage() {
     cat <<'HELP'
-Usage: transform_grants.sh [-e exclude] [-d db_map] [-u user_map] [-W 0|1] [-v|-vv] [input_file]
+Usage: transform_grants.sh [-e exclude] [-E exclude_regex] [-i include] [-I include_regex] [-d db_map] [-u user_map] [-W 0|1] [-v|-vv] [input_file]
 
 Options:
-  -e  要过滤的用户名，逗号分隔
+  -e  要排除的精确用户名，逗号分隔
       例: "dbmgr,mysql.sys,mysql.session"
+  -E  要排除的用户名正则，逗号分隔多个正则（任一匹配即排除）
+      例: "^mysql\\.,^sys_"
+  -i  仅复制包含在该列表中的原始用户名，逗号分隔（匹配发生在 -u 用户名映射之前）
+      例: "alice,bob,app_user"
+  -I  仅复制匹配该正则列表的原始用户名，逗号分隔多个正则（任一匹配即可）
+      匹配发生在 -u 用户名映射之前
+      例: "^app_,^(alice|bob)$"
   -d  数据库名称映射，格式 "旧名=新名"，多个用逗号分隔
       例: "db1=database1,db2=database2"
   -u  用户名映射，格式 "旧名=新名"，多个用逗号分隔
@@ -42,7 +52,12 @@ Options:
 
 Examples:
   pt-show-grants --host=src | ./transform_grants.sh -e "dbmgr"
+  pt-show-grants --host=src | ./transform_grants.sh -E "^mysql\\."
+  pt-show-grants --host=src | ./transform_grants.sh -i "app_user,etl_user"
+  pt-show-grants --host=src | ./transform_grants.sh -I "^app_"
+  pt-show-grants --host=src | ./transform_grants.sh -I "^app_,^etl_"
   ./transform_grants.sh -e "dbmgr" -d "db1=database1" -u "user1=account1" grants.sql
+  ./transform_grants.sh -i "alice,bob" -I "^app_" grants.sql
   ./transform_grants.sh -W 0 grants.sql
   ./transform_grants.sh -v grants.sql
   ./transform_grants.sh -vv grants.sql
@@ -50,15 +65,18 @@ HELP
     exit 0
 }
 
-while getopts "e:d:u:W:vh" opt; do
+while getopts "e:E:i:I:d:u:W:vh" opt; do
     case $opt in
         e) EXCLUDE_USERS="$OPTARG" ;;
+        E) EXCLUDE_USER_REGEX="$OPTARG" ;;
+        i) INCLUDE_USERS="$OPTARG" ;;
+        I) INCLUDE_USER_REGEX="$OPTARG" ;;
         d) DB_MAP="$OPTARG" ;;
         u) USER_MAP="$OPTARG" ;;
         W) REPLACE_HOST_WITH_WILDCARD="$OPTARG" ;;
         v) VERBOSE_LEVEL=$((VERBOSE_LEVEL + 1)) ;;
         h) usage ;;
-        *) echo "Usage: $0 [-e exclude] [-d db_map] [-u user_map] [-W 0|1] [-v|-vv] [input_file]" >&2; exit 1 ;;
+        *) echo "Usage: $0 [-e exclude] [-E exclude_regex] [-i include] [-I include_regex] [-d db_map] [-u user_map] [-W 0|1] [-v|-vv] [input_file]" >&2; exit 1 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -68,13 +86,46 @@ if [[ "$REPLACE_HOST_WITH_WILDCARD" != "0" && "$REPLACE_HOST_WITH_WILDCARD" != "
     exit 1
 fi
 
-awk -v exclude="$EXCLUDE_USERS" -v db_map="$DB_MAP" -v user_map="$USER_MAP" -v replace_host_with_wildcard="$REPLACE_HOST_WITH_WILDCARD" -v verbose_level="$VERBOSE_LEVEL" '
+awk -v exclude="$EXCLUDE_USERS" -v exclude_user_regex="$EXCLUDE_USER_REGEX" -v include_users="$INCLUDE_USERS" -v include_user_regex="$INCLUDE_USER_REGEX" -v db_map="$DB_MAP" -v user_map="$USER_MAP" -v replace_host_with_wildcard="$REPLACE_HOST_WITH_WILDCARD" -v verbose_level="$VERBOSE_LEVEL" '
 BEGIN {
     # 解析排除用户列表
     n = split(exclude, arr, ",")
     for (i = 1; i <= n; i++) {
         gsub(/^[ \t]+|[ \t]+$/, "", arr[i])
         if (arr[i] != "") excluded[arr[i]] = 1
+    }
+
+    # 解析排除用户正则列表（任一匹配即排除）
+    exclude_regex_count = 0
+    n = split(exclude_user_regex, exclude_regex_parts, ",")
+    for (i = 1; i <= n; i++) {
+        gsub(/^[ \t]+|[ \t]+$/, "", exclude_regex_parts[i])
+        if (exclude_regex_parts[i] != "") {
+            exclude_regex_count++
+            exclude_regexes[exclude_regex_count] = exclude_regex_parts[i]
+        }
+    }
+
+    # 解析包含用户列表（精确匹配）
+    include_user_count = 0
+    n = split(include_users, arr, ",")
+    for (i = 1; i <= n; i++) {
+        gsub(/^[ \t]+|[ \t]+$/, "", arr[i])
+        if (arr[i] != "") {
+            included[arr[i]] = 1
+            include_user_count++
+        }
+    }
+
+    # 解析包含用户正则列表（任一匹配即可）
+    include_regex_count = 0
+    n = split(include_user_regex, include_regex_parts, ",")
+    for (i = 1; i <= n; i++) {
+        gsub(/^[ \t]+|[ \t]+$/, "", include_regex_parts[i])
+        if (include_regex_parts[i] != "") {
+            include_regex_count++
+            include_regexes[include_regex_count] = include_regex_parts[i]
+        }
     }
 
     # 解析数据库名称映射: "old1=new1,old2=new2"
@@ -206,6 +257,28 @@ function mapped_uh(user, host) {
     return format_uh(mapped_user(user), mapped_host(host))
 }
 
+function user_excluded(user,    i) {
+    if (user in excluded) return 1
+    for (i = 1; i <= exclude_regex_count; i++) {
+        if (user ~ exclude_regexes[i]) return 1
+    }
+    return 0
+}
+
+function user_included(user,    i) {
+    if (include_user_count == 0 && include_regex_count == 0) return 1
+    if (user in included) return 1
+    for (i = 1; i <= include_regex_count; i++) {
+        if (user ~ include_regexes[i]) return 1
+    }
+    return 0
+}
+
+function user_selected(user) {
+    if (user_excluded(user)) return 0
+    return user_included(user)
+}
+
 function map_line_db_only(line,    i, mapped_line) {
     mapped_line = line
     for (i = 1; i <= db_count; i++) {
@@ -290,16 +363,16 @@ function flush_create() {
         current_uh = uh
 
         done_key = (replace_host_with_wildcard == "1") ? user : uh
-        if (!(user in excluded) && replace_host_with_wildcard == "1" && host != "" && host != "%") {
+        if (user_selected(user) && replace_host_with_wildcard == "1" && host != "" && host != "%") {
             if (done_key in done) {
                 record_change("host_merge", format_uh(user, host), mapped_uh(user, host))
             } else {
                 record_change("host_change", format_uh(user, host), mapped_uh(user, host))
             }
         }
-        if (user in excluded || done_key in done) {
+        if (!user_selected(user) || done_key in done) {
             skip_block = 1
-            if (!(user in excluded) && replace_host_with_wildcard == "1" && host != "" && host != "%") {
+            if (user_selected(user) && replace_host_with_wildcard == "1" && host != "" && host != "%") {
                 if (verbose_level >= 2) {
                     print "-- [HOST-MERGED] " format_uh(user, host) " -> " mapped_uh(user, host)
                     print "-- [SQL-SKIPPED] same user merged under wildcard host"
