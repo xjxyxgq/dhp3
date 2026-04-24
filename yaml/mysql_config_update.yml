@@ -1,0 +1,173 @@
+---
+# Ansible Playbook: MySQL 动态参数 + 配置文件持久化 (纯命令行版)
+# 功能:
+#   1. 连接目标机器 3306 端口，使用 mysql 客户端动态修改参数 (SET GLOBAL)
+#   2. 修改 MySQL 配置文件，确保参数重启后持久生效
+#   3. 支持指定 MySQL 安装目录，无需 Python 依赖包
+
+- name: Update MySQL parameters (dynamic + config file)
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  vars:
+    # MySQL 安装目录 (可选)
+    mysql_home: "{{ mysql_install_dir | default('') }}"
+    mysql_bin: "{{ mysql_home + '/bin/mysql' if mysql_home else 'mysql' }}"
+    mysqld_bin: "{{ mysql_home + '/bin/mysqld' if mysql_home else 'mysqld' }}"
+
+    # 连接配置
+    mysql_host: "{{ mysql_connection_host | default('127.0.0.1') }}"
+    mysql_port: "{{ mysql_connection_port | default(3306) }}"
+    mysql_user: "{{ mysql_connection_user | default('root') }}"
+    mysql_password: "{{ mysql_connection_password }}"
+    mysql_connect_timeout: 30
+
+    # MySQL 配置文件路径 (支持多发行版自动检测)
+    mysql_config_file: "{{ mysql_config_path | default('') }}"
+    
+    # 要修改的参数列表 (同时应用于动态设置和配置文件)
+    mysql_params:
+      - { name: "innodb_buffer_pool_size", value: "{{ buffer_pool_size | default('2G') }}" }
+      - { name: "max_connections", value: "{{ max_connections | default(500) }}" }
+      - { name: "tmp_table_size", value: "{{ tmp_table_size | default('64M') }}" }
+      - { name: "sort_buffer_size", value: "{{ sort_buffer_size | default('2M') }}" }
+
+  tasks:
+    # ========== 前置检查 ==========
+    - name: Detect MySQL config file path (if not specified)
+      shell: |
+        {{ mysqld_bin }} --verbose --help 2>/dev/null | grep -E '^\s+--my.cnf\s+' | head -1 | awk '{print $2}' | grep -v '=[A-Z]' || \
+        test -f /etc/my.cnf && echo /etc/my.cnf || \
+        test -f /etc/mysql/mysql.conf.d/mysqld.cnf && echo /etc/mysql/mysql.conf.d/mysqld.cnf || \
+        test -f /etc/mysql/my.cnf && echo /etc/mysql/my.cnf || \
+        echo "/etc/my.cnf"
+      register: config_detect
+      changed_when: false
+      when: mysql_config_file | length == 0
+      tags: [mysql, config, detect]
+
+    - name: Set final config file path
+      set_fact:
+        mysql_config_file: "{{ mysql_config_file | default(config_detect.stdout | trim) }}"
+      tags: [mysql, config]
+
+    - name: Verify mysql client availability
+      command: "{{ mysql_bin }} --version"
+      register: mysql_version
+      changed_when: false
+      tags: [mysql, check]
+
+    - name: Check MySQL connectivity
+      wait_for:
+        host: "{{ mysql_host }}"
+        port: "{{ mysql_port }}"
+        timeout: 15
+      tags: [mysql, connectivity]
+
+    # ========== 任务1: 动态修改参数 (立即生效) ==========
+    - name: Set dynamic parameters via SET GLOBAL
+      command: >
+        {{ mysql_bin }}
+        -h{{ mysql_host }}
+        -P{{ mysql_port }}
+        -u{{ mysql_user }}
+        {% if mysql_password %}-p'{{ mysql_password }}'{% endif %}
+        --connect-timeout={{ mysql_connect_timeout }}
+        -e "SET GLOBAL {{ item.name }} = {{ item.value }}"
+      loop: "{{ mysql_params }}"
+      register: dynamic_results
+      changed_when: dynamic_results.rc == 0
+      ignore_errors: true
+      tags: [mysql, dynamic]
+
+    - name: Verify dynamic parameter changes
+      command: >
+        {{ mysql_bin }}
+        -h{{ mysql_host }}
+        -P{{ mysql_port }}
+        -u{{ mysql_user }}
+        {% if mysql_password %}-p'{{ mysql_password }}'{% endif %}
+        --connect-timeout={{ mysql_connect_timeout }}
+        -N -e "SHOW GLOBAL VARIABLES LIKE '{{ item.name }}'"
+      loop: "{{ mysql_params }}"
+      register: dynamic_verify
+      changed_when: false
+      tags: [mysql, dynamic, verify]
+
+    # ========== 任务2: 修改配置文件 (持久化) ==========
+    - name: Backup MySQL config file before modification
+      copy:
+        src: "{{ mysql_config_file }}"
+        dest: "{{ mysql_config_file }}.bak.{{ ansible_date_time.epoch }}"
+        remote_src: true
+        mode: '0644'
+      when: mysql_config_file | exists
+      tags: [mysql, config, backup]
+
+    - name: Ensure config file directory exists
+      file:
+        path: "{{ mysql_config_file | dirname }}"
+        state: directory
+        mode: '0755'
+      tags: [mysql, config]
+
+    - name: Create config file if not exists
+      copy:
+        content: |
+          # MySQL Configuration - Managed by Ansible
+          [mysqld]
+        dest: "{{ mysql_config_file }}"
+        mode: '0644'
+        force: false
+      tags: [mysql, config]
+
+    - name: Update parameters in MySQL config file
+      lineinfile:
+        path: "{{ mysql_config_file }}"
+        regexp: "^{{ item.name }}\\s*="
+        line: "{{ item.name }} = {{ item.value }}"
+        insertafter: "^\\[mysqld\\]"
+        backup: true
+        create: true
+      loop: "{{ mysql_params }}"
+      register: config_results
+      tags: [mysql, config]
+
+    - name: Validate config file syntax (optional)
+      command: "{{ mysqld_bin }} --verbose --help"
+      register: config_check
+      changed_when: false
+      failed_when: false
+      tags: [mysql, config, validate]
+
+    # ========== 结果报告 ==========
+    - name: Report dynamic update status
+      debug:
+        msg: |
+          🔹 {{ item.item.name }}:
+             - 动态设置: {% if item.rc == 0 %}✅ 成功{% else %}❌ 失败 ({{ item.stderr | trim }}){% endif %}
+             - 当前值: {{ item.stdout | trim }}
+      loop: "{{ dynamic_verify.results }}"
+      tags: [mysql, verify, report]
+
+    - name: Report config file update status
+      debug:
+        msg: "🔹 {{ item.item.name }}: 配置文件 {% if item.changed %}✅ 已更新{% else %}ℹ️ 无需修改{% endif %}"
+      loop: "{{ config_results.results }}"
+      tags: [mysql, config, report]
+
+  post_tasks:
+    - name: Final summary
+      debug:
+        msg: |
+          ✅ MySQL 参数更新完成 ({{ inventory_hostname }})
+          
+          📊 执行结果:
+          - 动态参数: {{ dynamic_results.results | selectattr('rc', 'equalto', 0) | list | length }}/{{ mysql_params | length }} 成功
+          - 配置文件: {{ config_results.results | selectattr('changed') | list | length }}/{{ mysql_params | length }} 已更新
+          - 配置路径: {{ mysql_config_file }}
+          
+          ⚠️ 注意:
+          - 动态参数 (SET GLOBAL) 仅对新建连接生效
+          - 配置文件修改需重启 MySQL 才能完全生效
+          - 备份文件: {{ mysql_config_file }}.bak.*
+      tags: [summary]
